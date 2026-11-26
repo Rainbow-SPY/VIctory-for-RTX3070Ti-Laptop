@@ -179,10 +179,14 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 const DEFAULT_BUDGET_MS: u64 = 500;
-const MAX_BUDGET_MS: u64 = 10_000;
+const MAX_BUDGET_MS: u64 = DEFAULT_BUDGET_MS;
 
 fn parse_budget_ms(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
+}
+
+fn clamp_budget_ms(requested: u64) -> u64 {
+    requested.min(MAX_BUDGET_MS)
 }
 
 fn budget() -> Duration {
@@ -196,7 +200,7 @@ fn budget() -> Duration {
                         max_ms = MAX_BUDGET_MS,
                         "pipeline wait budget exceeds maximum; clamping"
                     );
-                    MAX_BUDGET_MS
+                    clamp_budget_ms(requested)
                 }
                 Some(requested) => requested,
                 None => {
@@ -400,6 +404,13 @@ mod tests {
         assert_eq!(parse_budget_ms(" 2000 "), Some(2000));
         assert_eq!(parse_budget_ms("-1"), None);
         assert_eq!(parse_budget_ms("not-a-number"), None);
+    }
+
+    #[test]
+    fn pipeline_budget_cannot_exceed_default_wait() {
+        assert_eq!(clamp_budget_ms(0), 0);
+        assert_eq!(clamp_budget_ms(DEFAULT_BUDGET_MS), DEFAULT_BUDGET_MS);
+        assert_eq!(clamp_budget_ms(2_000), DEFAULT_BUDGET_MS);
     }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
