@@ -14,9 +14,9 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! shortcut: the default budget (half a second of waiting per title frame)
+//! is a guess; `VICTORY_PIPELINE_BUDGET_MS` can increase it for a pass the
+//! title runs only once, but work whose pipeline takes longer is still lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -178,7 +178,49 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+const DEFAULT_BUDGET_MS: u64 = 500;
+const MAX_BUDGET_MS: u64 = 10_000;
+
+fn parse_budget_ms(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+fn budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ms = match std::env::var("VICTORY_PIPELINE_BUDGET_MS") {
+            Ok(value) => match parse_budget_ms(&value) {
+                Some(requested) if requested > MAX_BUDGET_MS => {
+                    tracing::warn!(
+                        requested_ms = requested,
+                        max_ms = MAX_BUDGET_MS,
+                        "pipeline wait budget exceeds maximum; clamping"
+                    );
+                    MAX_BUDGET_MS
+                }
+                Some(requested) => requested,
+                None => {
+                    tracing::warn!(
+                        value,
+                        default_ms = DEFAULT_BUDGET_MS,
+                        "invalid VICTORY_PIPELINE_BUDGET_MS; using default"
+                    );
+                    DEFAULT_BUDGET_MS
+                }
+            },
+            Err(std::env::VarError::NotPresent) => DEFAULT_BUDGET_MS,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    default_ms = DEFAULT_BUDGET_MS,
+                    "non-Unicode VICTORY_PIPELINE_BUDGET_MS; using default"
+                );
+                DEFAULT_BUDGET_MS
+            }
+        };
+        tracing::info!(ms, "host pipeline wait budget per frame");
+        Duration::from_millis(ms)
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -240,7 +282,7 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -351,6 +393,14 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_budget_parses_unsigned_milliseconds() {
+        assert_eq!(parse_budget_ms("0"), Some(0));
+        assert_eq!(parse_budget_ms(" 2000 "), Some(2000));
+        assert_eq!(parse_budget_ms("-1"), None);
+        assert_eq!(parse_budget_ms("not-a-number"), None);
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.
